@@ -745,7 +745,7 @@ class RenewalBot:
             parts = date_str.split("-")
             if len(parts) == 3:
                 _, month, day = parts
-                cron_expr = f"0 0 {int(day)} {int(month)} *"
+                cron_expr = f"27 0 {int(day)} {int(month)} *"
                 self.log(f"📅 下次续约日期: {date_str}", LogLevel.INFO)
                 self.log(f"🔄 设置下次运行 cron: {cron_expr}", LogLevel.INFO)
 
