@@ -837,7 +837,7 @@ class RenewalBot:
         status = "成功"
         exit_code = EXIT_SUCCESS
         try:
-            self.log("--- 开始 Euserv 自动续期任务 ---")
+            self.log("--- 开始euserv-renewal-bot自动续期任务 ---")
 
             # 预加载 OCR 模型，减少首次验证码识别延迟
             self.prewarm_ocr()
