@@ -1,891 +1,364 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
-# Inspired by https://github.com/zensea/AutoEUServerlessWith2FA and https://github.com/WizisCool/AutoEUServerless
-
 import os
-import re
 import time
-import base64
-from enum import Enum
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from bs4 import BeautifulSoup
-import imaplib
-import email
-from email.message import Message
-from datetime import date
-from typing import Any, Callable
-import smtplib
-from email.mime.text import MIMEText
-import hmac
-import struct
-import ast
-import operator
+import traceback
+import html
+import re
+import base64
+from datetime import datetime, timedelta, timezone
+from playwright.sync_api import sync_playwright
 
+def apply_stealth(page):
+    try:
+        from playwright_stealth import Stealth
+        Stealth().apply_stealth_sync(page)
+    except ImportError:
+        from playwright_stealth import stealth_sync
+        stealth_sync(page)
 
-# 自定义异常类
-class CaptchaError(Exception):
-    """验证码处理相关错误"""
+# ==========================================
+# 电报推送小助手 (强制锁定中国北京时间)
+# ==========================================
+def send_tg_msg(message, process_logs=None):
+    token = os.environ.get('TG_BOT_TOKEN')
+    chat_id = os.environ.get('TG_CHAT_ID')
+    
+    # 严谨校验：如果没有配置电报密钥，直接跳过推送，绝不阻断主程序运行
+    if not token or not chat_id:
+        return
+        
+    # 如果有收集到的执行过程日志，拼接到消息最下方
+    if process_logs:
+        log_content = "\n".join([f"<code>{html.escape(l)}</code>" for l in process_logs])
+        message += f"\n\n<b>[执行过程详情]</b>\n{log_content}"
+        
+    # 强制将推送时间格式化为北京时间 UTC+8
+    bj_time = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    full_message = f"{message}\n\n[时间] 巡检时间: {bj_time} (北京时间)"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    
+    try:
+        requests.post(url, json={"chat_id": chat_id, "text": full_message, "parse_mode": "HTML"}, timeout=10)
+    except Exception as e:
+        # 严谨处理：推送就算失败也绝不抛出异常导致脚本崩溃，默默吞下错误
+        print(f"[警告] TG推送失败: {e}")
+        pass
 
-
-class PinRetrievalError(Exception):
-    """PIN码获取相关错误"""
-
-
-class LoginError(Exception):
-    """登录相关错误"""
-
-
-class RenewalError(Exception):
-    """续期相关错误"""
-
-
-# 环境变量配置
-EUSERV_USERNAME = os.getenv("EUSERV_USERNAME", "")
-EUSERV_PASSWORD = os.getenv("EUSERV_PASSWORD", "")
-EUSERV_2FA = os.getenv("EUSERV_2FA", "")
-CAPTCHA_USERID = os.getenv("CAPTCHA_USERID", "")
-CAPTCHA_APIKEY = os.getenv("CAPTCHA_APIKEY", "")
-EMAIL_HOST = os.getenv("EMAIL_HOST", "")
-EMAIL_USERNAME = os.getenv("EMAIL_USERNAME", "")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")
-NOTIFICATION_EMAIL = os.getenv("NOTIFICATION_EMAIL", "")
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
-
-# 时间配置 (秒)
-LOGIN_MAX_RETRY_COUNT = 3
-PIN_WAIT_SECONDS = 30
-HTTP_TIMEOUT_SECONDS = 30
-RETRY_DELAY_SECONDS = 5
-SERVER_LIST_RETRY_DELAY = 30
-API_TIMEOUT_SECONDS = 20
-POST_RENEWAL_CHECK_DELAY = 15
-EMAIL_CHECK_INTERVAL = 30
-EMAIL_MAX_RETRIES = 3
-
-# 退出码定义 (用于智能调度)
-EXIT_SUCCESS = 0  # 续约成功或无需续约
-EXIT_FAILURE = 1  # 续约失败，需要重试
-EXIT_SKIPPED = 2  # 未到续约日期，跳过执行
-
-# SMTP 配置 (可选环境变量)
-SMTP_HOST = os.getenv("SMTP_HOST") or (
-    EMAIL_HOST.replace("imap", "smtp") if EMAIL_HOST else ""
-)
-_smtp_port_env = os.getenv("SMTP_PORT", "")
-SMTP_PORT = int(_smtp_port_env) if _smtp_port_env and _smtp_port_env.strip() else 587
-
-# GitHub Actions 输出文件
-GITHUB_OUTPUT = os.getenv("GITHUB_OUTPUT", "")
-
-# 登录检测字符串常量
-CAPTCHA_PROMPT = "To finish the login process please solve the following captcha."
-TWO_FA_PROMPT = (
-    "To finish the login process enter the PIN that is shown in yout authenticator app."
-)
-LOGIN_SUCCESS_INDICATORS = ("Hello", "Confirm or change your customer data here")
-RENEWAL_DATE_PATTERN = r"Contract extension possible from"
-
-# URL 常量
-EUSERV_ORIGIN = "https://support.euserv.com"
-EUSERV_BASE_URL = f"{EUSERV_ORIGIN}/index.iphp"
-EUSERV_CAPTCHA_URL = f"{EUSERV_ORIGIN}/securimage_show.php"
-TRUECAPTCHA_API_URL = "https://api.apitruecaptcha.org/one/gettext"
-
-
-class LogLevel(Enum):
-    """日志级别枚举"""
-
-    INFO = "ℹ️"
-    SUCCESS = "✅"
-    WARNING = "⚠️"
-    ERROR = "❌"
-    PROGRESS = "🔄"
-    CELEBRATION = "🎉"
-
-
-def _hotp(key: str, counter: int, digits: int = 6, digest: str = "sha1") -> str:
-    """HOTP 算法实现"""
-    key_bytes = base64.b32decode(key.upper() + "=" * ((8 - len(key)) % 8))
-    counter_bytes = struct.pack(">Q", counter)
-    mac = hmac.new(key_bytes, counter_bytes, digest).digest()
-    offset = mac[-1] & 0x0F
-    binary = struct.unpack(">L", mac[offset : offset + 4])[0] & 0x7FFFFFFF  # type: ignore[index]
-    return str(binary)[-digits:].zfill(digits)  # type: ignore[index]
-
-
-def _totp(key: str, time_step: int = 30, digits: int = 6, digest: str = "sha1") -> str:
-    """TOTP 算法实现"""
-    return _hotp(key, int(time.time() / time_step), digits, digest)
-
-
-def _safe_eval_math(expr: str) -> int | None:
-    """安全计算简单数学表达式 (仅支持 +, -, *, /)"""
-    ops: dict[Any, Callable[[Any, Any], Any]] = {
-        ast.Add: operator.add,
-        ast.Sub: operator.sub,
-        ast.Mult: operator.mul,
-        ast.Div: operator.floordiv,
-    }
-
-    def _eval(node):
-        if isinstance(node, ast.Constant):
-            return node.value
-        if isinstance(node, ast.BinOp) and type(node.op) in ops:
-            return ops[type(node.op)](_eval(node.left), _eval(node.right))
-        raise ValueError("Unsupported expression")
+# ==========================================
+# 核心灵魂：动态时区转换与 Github 规则篡改 (锁定日本13:27)
+# ==========================================
+def update_github_cron(target_date_str, log_step):
+    pat = os.environ.get('PAT_WITH_WORKFLOW_SCOPE')
+    repo = os.environ.get('GITHUB_REPOSITORY') 
+    
+    if not pat or not repo:
+        log_step("[警告] 未检测到 PAT_WITH_WORKFLOW_SCOPE，放弃修改调度时间。")
+        return
 
     try:
-        return int(_eval(ast.parse(expr, mode="eval").body))
-    except (SyntaxError, ValueError, TypeError, ZeroDivisionError):
-        return None
-
-
-def _clean_math_expr(raw: str) -> str:
-    """统一清洗验证码数学表达式：替换常见字符并保留数字与运算符。"""
-    cleaned = (
-        raw.replace("x", "*")
-        .replace("X", "*")
-        .replace("=", "")
-        .replace(" ", "")
-        .strip()
-    )
-    return "".join(c for c in cleaned if c in "0123456789+-*/")
-
-
-def _try_solve_math(raw: str) -> str | None:
-    """尝试将原始文本作为数学表达式求解，失败返回 None。"""
-    cleaned = _clean_math_expr(raw)
-    if cleaned and any(op in cleaned for op in ["+", "-", "*", "/"]):
-        result = _safe_eval_math(cleaned)
-        if result is not None:
-            return str(result)
-    return None
-
-
-class RenewalBot:
-    """
-    Euserv VPS 自动续期机器人类。
-
-    封装了所有业务逻辑和状态，提供更好的可测试性和可维护性。
-    """
-
-    def __init__(self):
-        """初始化机器人实例。"""
-        self.log_messages: list[str] = []
-        self.current_login_attempt = 1
-        self.session: requests.Session | None = None
-        self.sess_id: str | None = None
-        self._ocr = None  # OCR 实例懒加载
-
-    def _cleanup(self) -> None:
-        """清理资源，关闭 HTTP Session"""
-        if self.session:
-            self.session.close()
-            self.session = None
-
-    # ==================== 日志相关 ====================
-
-    def log(self, info: str, level: LogLevel = LogLevel.INFO) -> None:
-        """记录日志消息到实例日志列表。"""
-        formatted = f"{level.value} {info}" if level != LogLevel.INFO else info
-        print(formatted)
-        self.log_messages.append(formatted)
-
-    # ==================== 配置验证 ====================
-
-    def validate_config(self) -> tuple[bool, list[str]]:
-        """验证必需配置，返回 (是否通过, 缺失项列表)。"""
-        required = {
-            "EUSERV_USERNAME": EUSERV_USERNAME,
-            "EUSERV_PASSWORD": EUSERV_PASSWORD,
-            "EMAIL_HOST": EMAIL_HOST,
-            "EMAIL_USERNAME": EMAIL_USERNAME,
-            "EMAIL_PASSWORD": EMAIL_PASSWORD,
-        }
-        missing = [k for k, v in required.items() if not v]
-        return len(missing) == 0, missing
-
-    # ==================== 邮件发送 ====================
-
-    def send_status_email(self, subject_status: str) -> None:
-        """发送状态通知邮件。"""
-        if not (NOTIFICATION_EMAIL and EMAIL_USERNAME and EMAIL_PASSWORD):
-            self.log("邮件通知所需的一个或多个Secrets未设置，跳过发送邮件。")
-            return
-        if not SMTP_HOST:
-            self.log("无法推断 SMTP 服务器地址，跳过发送邮件。")
-            return
-        self.log("正在准备发送状态通知邮件...")
-        sender = EMAIL_USERNAME
-        recipient = NOTIFICATION_EMAIL
-        subject = f"Euserv 续约脚本运行报告 - {subject_status}"
-        body = "Euserv 自动续约脚本本次运行的详细日志如下：\n\n" + "\n".join(
-            self.log_messages
-        )
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = subject
-        msg["From"] = sender
-        msg["To"] = recipient
-        try:
-            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=HTTP_TIMEOUT_SECONDS)
-            server.starttls()
-            server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_USERNAME, [recipient], msg.as_string())
-            server.quit()
-            self.log("状态通知邮件已成功发送！", LogLevel.CELEBRATION)
-        except smtplib.SMTPException as e:
-            self.log(f"发送邮件失败: {e}", LogLevel.ERROR)
-
-    # ==================== OCR 相关 ====================
-
-    def _get_ocr(self):
-        """获取或创建 OCR 实例（懒加载单例）"""
-        if self._ocr is None:
-            import ddddocr
-
-            self._ocr = ddddocr.DdddOcr(show_ad=False)
-        return self._ocr
-
-    def prewarm_ocr(self) -> None:
-        """预加载 OCR 模型，减少首次识别延迟"""
-        self.log("正在预加载 OCR 模型...", LogLevel.PROGRESS)
-        try:
-            self._get_ocr()
-            self.log("OCR 模型预加载完成", LogLevel.SUCCESS)
-        except Exception as e:
-            self.log(f"OCR 预加载失败 (将在需要时重试): {e}", LogLevel.WARNING)
-
-    def _solve_captcha_local(self, image_bytes: bytes) -> str | None:
-        """使用本地 ddddocr 识别验证码"""
-        ocr = self._get_ocr()
-        # 限制字符集为数字和运算符，提高数学验证码识别率
-        ocr.set_ranges("0123456789+-x/=")
-        captcha_text = ocr.classification(image_bytes)
-
-        if not captcha_text:
-            return None
-
-        # 尝试作为数学表达式计算
-        result = _try_solve_math(captcha_text)
-        return result if result else captcha_text
-
-    def _solve_captcha_api(self, image_bytes: bytes) -> str | None:
-        """使用 TrueCaptcha API 识别验证码"""
-        encoded_string = base64.b64encode(image_bytes).decode("ascii")
-
-        data = {
-            "userid": CAPTCHA_USERID,
-            "apikey": CAPTCHA_APIKEY,
-            "data": encoded_string,
-        }
-
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                # 使用全局 requests.post 而非 self.session.post，
-                # 避免将 EUserv 的 cookies 发送到第三方 API
-                api_response = requests.post(
-                    url=TRUECAPTCHA_API_URL, json=data, timeout=API_TIMEOUT_SECONDS
-                )
-                api_response.raise_for_status()
-                result_data = api_response.json()
-
-                if result_data.get("status") == "error":
-                    self.log(f"API返回错误: {result_data.get('message')}")
-                    return None
-
-                captcha_text = result_data.get("result")
-                if captcha_text:
-                    # 使用统一的数学表达式求解
-                    result = _try_solve_math(captcha_text)
-                    return result if result else captcha_text
-
-            except requests.RequestException as e:
-                self.log(f"API请求失败 (尝试 {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(RETRY_DELAY_SECONDS)
-
-        return None
-
-    def _solve_captcha(self, image_bytes: bytes) -> str:
-        """双保险验证码识别：本地优先，第3次尝试起强制使用API兜底"""
-
-        # 如果是第3次（或更多次）尝试，且配置了 API，则直接使用 API
-        if self.current_login_attempt >= 3 and CAPTCHA_USERID and CAPTCHA_APIKEY:
-            self.log(
-                f"检测到第 {self.current_login_attempt} 次登录尝试，为保证成功率，直接切换到 TrueCaptcha API..."
-            )
-            result = self._solve_captcha_api(image_bytes)
-            if result:
-                self.log(f"API 识别成功: {result}")
-                return result
-
-        # 否则优先尝试本地 OCR
-        self.log("正在使用本地 OCR (ddddocr) 识别验证码...")
-        try:
-            result = self._solve_captcha_local(image_bytes)
-            if result:
-                self.log(f"本地 OCR 识别成功: {result}")
-                return result
-        except Exception as e:
-            self.log(f"本地 OCR 识别报错: {e}")
-
-        # 如果本地识别失败，回退到 API
-        self.log("本地 OCR 识别失败，尝试切换到 TrueCaptcha API...")
-        if CAPTCHA_USERID and CAPTCHA_APIKEY:
-            result = self._solve_captcha_api(image_bytes)
-            if result:
-                self.log(f"API 识别成功: {result}")
-                return result
-            raise CaptchaError("TrueCaptcha API 也无法识别验证码")
-        else:
-            raise CaptchaError("本地 OCR 识别失败且未配置 API 凭据")
-
-    # ==================== 验证码和2FA处理 ====================
-
-    def _handle_captcha(self, url: str, captcha_image_url: str, headers: dict) -> requests.Response | None:
-        """处理图片验证码，返回更新后的响应"""
-        self.log("检测到图片验证码，正在处理...")
-        image_res = self.session.get(
-            captcha_image_url,
-            headers={"user-agent": USER_AGENT},
-            timeout=HTTP_TIMEOUT_SECONDS,
-        )
-        image_res.raise_for_status()
-        image_bytes = image_res.content
-
-        captcha_code = self._solve_captcha(image_bytes)
-
-        self.log(f"验证码计算结果是: {captcha_code}")
-        post_data = {
-            "email": EUSERV_USERNAME,
-            "password": EUSERV_PASSWORD,
-            "subaction": "login",
-            "sess_id": self.sess_id,
-            "captcha_code": str(captcha_code),
-        }
-        response = self.session.post(
-            url, headers=headers, data=post_data, timeout=HTTP_TIMEOUT_SECONDS
-        )
-
-        if CAPTCHA_PROMPT in response.text:
-            self.log("图片验证码验证失败")
-            # 验证失败时保存验证码图片用于调试
-            try:
-                with open("captcha_failed.png", "wb") as f:
-                    f.write(image_bytes)
-                self.log(
-                    f"失败的验证码图片已保存到 captcha_failed.png，识别结果为: {captcha_code}"
-                )
-            except OSError as e:
-                self.log(f"保存验证码图片失败: {e}")
-            return None
-        self.log("图片验证码验证通过")
-        return response
-
-    def _handle_2fa(self, response_text: str) -> requests.Response | None:
-        """处理2FA验证，返回更新后的响应"""
-        self.log("检测到需要2FA验证")
-        if not EUSERV_2FA:
-            self.log("未配置EUSERV_2FA Secret，无法进行2FA登录。")
-            return None
-
-        two_fa_code = _totp(EUSERV_2FA)
-        self.log(f"已生成2FA动态密码: ****{two_fa_code[-2:]}")  # type: ignore[index]
-
-        soup = BeautifulSoup(response_text, "html.parser")
-        hidden_inputs = soup.find_all("input", type="hidden")
-        two_fa_data = {inp["name"]: inp.get("value", "") for inp in hidden_inputs}
-        two_fa_data["pin"] = two_fa_code
-
-        response = self.session.post(
-            EUSERV_BASE_URL,
-            headers={"user-agent": USER_AGENT, "origin": EUSERV_ORIGIN},
-            data=two_fa_data,
-            timeout=HTTP_TIMEOUT_SECONDS,
-        )
-        if TWO_FA_PROMPT in response.text:
-            self.log("2FA验证失败")
-            return None
-        self.log("2FA验证通过")
-        return response
-
-    @staticmethod
-    def _is_login_success(response_text: str) -> bool:
-        """检查是否登录成功"""
-        return any(indicator in response_text for indicator in LOGIN_SUCCESS_INDICATORS)
-
-    # ==================== 登录流程 ====================
-
-    def _refresh_session(self) -> None:
-        """续期流程后重新登录，确保 session 未过期。"""
-        self.log("续期操作时间较长，正在重新登录以刷新 session...")
-        self._cleanup()
-        self._perform_login()
-
-    def _safe_refresh_session(self) -> None:
-        """安全刷新 session，失败时仅记录警告而不影响主流程状态。"""
-        try:
-            self._refresh_session()
-        except LoginError as e:
-            self.log(f"刷新 session 失败 (不影响已提交的续约): {e}", LogLevel.WARNING)
-
-    def _perform_login(self) -> None:
-        """执行登录流程，包含重试逻辑。成功后设置 self.sess_id 和 self.session。"""
-        headers = {"user-agent": USER_AGENT, "origin": EUSERV_ORIGIN}
-        self.session = requests.Session()
-
-        # 配置自动重试策略 (仅对连接错误和 5xx 状态码重试)
-        retry_strategy = Retry(
-            total=2,
-            backoff_factor=1,
-            status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["GET", "POST"],
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("https://", adapter)
-
-        for attempt in range(LOGIN_MAX_RETRY_COUNT):
-            self.current_login_attempt = attempt + 1
-            if attempt > 0:
-                self.log(f"登录尝试第 {attempt + 1}/{LOGIN_MAX_RETRY_COUNT} 次...")
-                time.sleep(RETRY_DELAY_SECONDS)
-
-            try:
-                if self._attempt_login(headers):
-                    return
-            except (requests.RequestException, ValueError) as e:
-                self.log(f"登录尝试失败: {e}")
-
-        raise LoginError("登录失败次数过多，退出脚本。")
-
-    def _attempt_login(self, headers: dict) -> bool:
-        """单次登录尝试，成功返回 True 并设置 self.sess_id/self.session。"""
-        sess_res = self.session.get(
-            EUSERV_BASE_URL, headers=headers, timeout=HTTP_TIMEOUT_SECONDS
-        )
-        sess_res.raise_for_status()
-        sess_id = sess_res.cookies.get("PHPSESSID")
-        if not sess_id:
-            raise ValueError("无法从初始响应的Cookie中找到PHPSESSID")
-
-        # [C1 fix] 立即同步 sess_id，确保后续验证码/2FA 流程可用
-        self.sess_id = sess_id
-
-        # 模拟浏览器行为：请求 logo 以获取完整的 Cookie 链
-        self.session.get(
-            f"{EUSERV_ORIGIN}/pic/logo_small.png",
-            headers=headers,
-            timeout=HTTP_TIMEOUT_SECONDS,
-        )
-
-        login_data = {
-            "email": EUSERV_USERNAME,
-            "password": EUSERV_PASSWORD,
-            "form_selected_language": "en",
-            "Submit": "Login",
-            "subaction": "login",
-            "sess_id": sess_id,
-        }
-        response = self.session.post(
-            EUSERV_BASE_URL,
-            headers=headers,
-            data=login_data,
-            timeout=HTTP_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-
-        if self._is_login_success(response.text):
-            self.log("登录成功")
-            return True
-
-        # 处理验证码
-        if CAPTCHA_PROMPT in response.text:
-            response = self._handle_captcha(EUSERV_BASE_URL, EUSERV_CAPTCHA_URL, headers)
-            if response is None:
-                return False
-
-        # 处理2FA
-        if TWO_FA_PROMPT in response.text:
-            response = self._handle_2fa(response.text)
-            if response is None:
-                return False
-
-        if self._is_login_success(response.text):
-            self.log("登录成功")
-            return True
-
-        self.log("登录失败，所有验证尝试后仍未成功。")
-        return False
-
-    # ==================== PIN 码获取 ====================
-
-    @staticmethod
-    def _extract_email_body(msg: Message) -> str:
-        """从邮件消息中提取正文内容"""
-        def _decode_payload(part: Message) -> str:
-            charset = part.get_content_charset() or "utf-8"
-            payload = part.get_payload(decode=True)
-            if payload is None:
-                return ""
-            if isinstance(payload, bytes):
-                return payload.decode(charset, errors="replace")
-            return str(payload)
-
-        if msg.is_multipart():
-            for part in msg.walk():
-                if part.get_content_type() == "text/plain":
-                    return _decode_payload(part)
-            return ""
-        return _decode_payload(msg)
-
-    def _fetch_pin_from_email(
-        self, mail: imaplib.IMAP4_SSL, search_criteria: str
-    ) -> str | None:
-        """从邮箱中搜索并提取PIN码"""
-        status, messages = mail.search(None, search_criteria)
-        if status != "OK" or not messages[0]:
-            return None
-
-        latest_email_id = messages[0].split()[-1]
-        _, data = mail.fetch(latest_email_id, "(RFC822)")
-        if not data or not data[0] or not isinstance(data[0], tuple):
-            return None
-        raw_data = data[0][1]  # type: ignore
-        if not isinstance(raw_data, bytes):
-            return None
-        raw_email = raw_data.decode("utf-8")
-        msg = email.message_from_string(raw_email)
-        body = self._extract_email_body(msg)
-
-        pin_match = re.search(r"PIN:\s*\n?(\d{6})", body, re.IGNORECASE)
-        if pin_match:
-            return pin_match.group(1)
-        return None
-
-    def _try_fetch_pin_once(self, search_criteria: str) -> str | None:
-        """单次尝试从 Gmail 获取 PIN 码"""
-        mail = imaplib.IMAP4_SSL(EMAIL_HOST or "imap.gmail.com")
-        try:
-            mail.login(EMAIL_USERNAME or "", EMAIL_PASSWORD or "")
-            mail.select("inbox")
-            pin = self._fetch_pin_from_email(mail, search_criteria)
-            if pin:
-                self.log(f"成功从Gmail获取PIN码: ****{str(pin)[-2:]}")  # type: ignore[index]
-                return pin
-        finally:
-            try:
-                mail.logout()
-            except Exception:
-                pass
-        return None
-
-    def _get_pin_from_gmail(self) -> str:
-        """从Gmail获取PIN码"""
-        self.log("正在连接Gmail获取PIN码...")
-        today_str = date.today().strftime("%d-%b-%Y")
-        search_criteria = f'(SINCE "{today_str}" FROM "no-reply@euserv.com" SUBJECT "EUserv - PIN for the Confirmation of a Security Check")'
-
-        last_error: Exception | None = None
-        for i in range(EMAIL_MAX_RETRIES):
-            try:
-                pin = self._try_fetch_pin_once(search_criteria)
-                if pin:
-                    return pin
-                self.log(f"第{i + 1}次尝试：未找到PIN邮件，等待{EMAIL_CHECK_INTERVAL}秒...")
-                time.sleep(EMAIL_CHECK_INTERVAL)
-            except (imaplib.IMAP4.error, OSError) as e:
-                last_error = e
-                self.log(f"获取PIN码时发生错误 (尝试 {i + 1}/{EMAIL_MAX_RETRIES}): {e}")
-                if i < EMAIL_MAX_RETRIES - 1:
-                    self.log(f"将在 {EMAIL_CHECK_INTERVAL} 秒后重试...")
-                    time.sleep(EMAIL_CHECK_INTERVAL)
-        if last_error:
-            if isinstance(last_error, Exception):
-                raise PinRetrievalError(f"邮件连接错误: {last_error}") from last_error
-            raise PinRetrievalError(f"邮件连接错误: {last_error}")
-        raise PinRetrievalError("多次尝试后仍无法获取PIN码邮件。")
-
-    # ==================== 服务器列表 ====================
-
-    def _parse_server_row(self, tr) -> dict | None:
-        """解析单行 <tr> 元素，返回服务器信息字典，无效行返回 None。"""
-        server_id_tag = tr.select_one(".td-z1-sp1-kc")
-        if not server_id_tag:
-            return None
-        server_id = server_id_tag.get_text(strip=True)
-        action_container = tr.select_one(".td-z1-sp2-kc .kc2_order_action_container")
-        if not action_container:
-            return None
-        action_text = action_container.get_text()
-        if RENEWAL_DATE_PATTERN in action_text:
-            renewal_date_match = re.search(r"\d{4}-\d{2}-\d{2}", action_text)
-            renewal_date = (
-                renewal_date_match.group(0) if renewal_date_match else "未知日期"
-            )
-            return {"id": server_id, "renewable": False, "date": renewal_date}
-        return {"id": server_id, "renewable": True, "date": None}
-
-    def _get_servers(self) -> list[dict]:
-        """获取服务器列表及其续约状态"""
-        self.log("正在访问服务器列表页面...")
-        url = f"{EUSERV_BASE_URL}?sess_id={self.sess_id}"
-        headers = {"user-agent": USER_AGENT}
-        f = self.session.get(url=url, headers=headers, timeout=HTTP_TIMEOUT_SECONDS)
-        f.raise_for_status()
-        soup = BeautifulSoup(f.text, "html.parser")
-        selector = "#kc2_order_customer_orders_tab_content_1 .kc2_order_table.kc2_content_table tr, #kc2_order_customer_orders_tab_content_2 .kc2_order_table.kc2_content_table tr"
-        matched_rows = soup.select(selector)
-        server_list = [
-            s for s in (self._parse_server_row(tr) for tr in matched_rows) if s is not None
-        ]
-        self.log(f"发现 {len(server_list)} 台服务器合同")
-
-        if not server_list:
-            self.log(
-                "⚠️ 未能从页面解析出任何服务器信息，可能是页面结构变化！",
-                LogLevel.WARNING,
-            )
-            # 保存 HTML 用于离线调试
-            try:
-                with open("debug_page.html", "w", encoding="utf-8") as debug_f:
-                    debug_f.write(f.text)
-                self.log("已保存页面 HTML 到 debug_page.html", LogLevel.INFO)
-            except OSError as e:
-                self.log(f"保存调试页面失败: {e}", LogLevel.WARNING)
-
-        return server_list
-
-    # ==================== 续期流程 ====================
-
-    def _renew(self, order_id: str) -> None:
-        """执行服务器续约流程"""
-        self.log(f"正在为服务器 {order_id} 触发续订流程...")
-        url = EUSERV_BASE_URL
+        # 日本时间 -> UTC 时间的精准降维打击
+        jst = timezone(timedelta(hours=9))
+        
+        # 核心修改：解析目标日期，并设定为日本时间下午 13:27 执行
+        target_dt_jst = datetime.strptime(target_date_str, "%Y-%m-%d").replace(hour=13, minute=27, tzinfo=jst)
+        
+        # 转换为 Github 唯一能看懂的 UTC 时间 (13:27 JST = 04:27 UTC)
+        target_dt_utc = target_dt_jst.astimezone(timezone.utc)
+
+        # 提取转换后的 UTC 月、日、时、分，构造全新的 cron 表达式
+        new_cron = f"{target_dt_utc.minute} {target_dt_utc.hour} {target_dt_utc.day} {target_dt_utc.month} *"
+
+        api_url = f"https://api.github.com/repos/{repo}/contents/.github/workflows/run.yml"
         headers = {
-            "user-agent": USER_AGENT,
-            "Host": "support.euserv.com",
-            "origin": EUSERV_ORIGIN,
+            "Authorization": f"token {pat}",
+            "Accept": "application/vnd.github.v3+json"
         }
-        data1 = {
-            "Submit": "Extend contract",
-            "sess_id": self.sess_id,
-            "ord_no": order_id,
-            "subaction": "choose_order",
-            "choose_order_subaction": "show_contract_details",
+
+        # 1. 获取当前的 run.yml 源码
+        resp = requests.get(api_url, headers=headers)
+        if resp.status_code != 200:
+            log_step(f"[警告] 无法读取 YAML 文件: {resp.text}")
+            return
+            
+        data = resp.json()
+        content = base64.b64decode(data['content']).decode('utf-8')
+        sha = data['sha']
+
+        # 2. 用正则精准替换旧的 cron 为新的 cron
+        new_content = re.sub(r"cron:\s*['\"].*?['\"]", f"cron: '{new_cron}'", content)
+
+        if new_content == content:
+            log_step(f"[成功] 定时任务已是最新状态。下一次将在日本时间 {target_date_str} 13:27 准时苏醒！ (内部UTC Cron: {new_cron})")
+            return
+
+        # 3. 提交修改，篡改历史！
+        commit_data = {
+            "message": f"[自动调度] 下次唤醒锁定于日本时间 {target_date_str} 13:27",
+            "content": base64.b64encode(new_content.encode('utf-8')).decode('utf-8'),
+            "sha": sha
         }
-        step1 = self.session.post(
-            url, headers=headers, data=data1, timeout=HTTP_TIMEOUT_SECONDS
-        )
-        step1.raise_for_status()
-        data2 = {
-            "sess_id": self.sess_id,
-            "subaction": "show_kc2_security_password_dialog",
-            "prefix": "kc2_customer_contract_details_extend_contract_",
-            "type": "1",
-        }
-        step2 = self.session.post(
-            url, headers=headers, data=data2, timeout=HTTP_TIMEOUT_SECONDS
-        )
-        step2.raise_for_status()
-        time.sleep(PIN_WAIT_SECONDS)
-        pin = self._get_pin_from_gmail()
-        data3 = {
-            "auth": pin,
-            "sess_id": self.sess_id,
-            "subaction": "kc2_security_password_get_token",
-            "prefix": "kc2_customer_contract_details_extend_contract_",
-            "type": 1,
-            "ident": f"kc2_customer_contract_details_extend_contract_{order_id}",
-        }
-        f = self.session.post(
-            url, headers=headers, data=data3, timeout=HTTP_TIMEOUT_SECONDS
-        )
-        f.raise_for_status()
-        response_json = f.json()
-        if response_json.get("rs") != "success":
-            raise RenewalError(f"获取Token失败: {f.text}")
-        token = response_json["token"]["value"]
-        self.log("成功获取续期Token")
-        data4 = {
-            "sess_id": self.sess_id,
-            "ord_id": order_id,
-            "subaction": "kc2_customer_contract_details_extend_contract_term",
-            "token": token,
-        }
-        final_res = self.session.post(
-            url, headers=headers, data=data4, timeout=HTTP_TIMEOUT_SECONDS
-        )
-        final_res.raise_for_status()
-
-    # ==================== 续期后检查 ====================
-
-    def _log_non_renewable_servers(self, all_servers: list) -> None:
-        """记录无需续期的服务器信息并输出下次续约日期。"""
-        self.log("检测到所有服务器均无需续期。详情如下：", LogLevel.SUCCESS)
-        earliest_date = None
-        for server in all_servers:
-            if not server["renewable"]:
-                self.log(f"   - 服务器 {server['id']}: 可续约日期为 {server['date']}")
-                if server["date"] and server["date"] != "未知日期":
-                    if earliest_date is None or server["date"] < earliest_date:
-                        earliest_date = server["date"]
-
-        if earliest_date and GITHUB_OUTPUT:
-            self._output_next_schedule(str(earliest_date))
-
-    def _output_next_schedule(self, date_str: str) -> None:
-        """输出下次续约日期的 cron 表达式到 GITHUB_OUTPUT。"""
-        try:
-            parts = date_str.split("-")
-            if len(parts) == 3:
-                _, month, day = parts
-                cron_expr = f"27 0 {int(day)} {int(month)} *"
-                self.log(f"📅 下次续约日期: {date_str}", LogLevel.INFO)
-                self.log(f"🔄 设置下次运行 cron: {cron_expr}", LogLevel.INFO)
-
-                with open(GITHUB_OUTPUT, "a") as f:
-                    f.write(f"next_cron={cron_expr}\n")
-                    f.write(f"next_date={date_str}\n")
-        except (ValueError, OSError) as e:
-            self.log(f"解析续约日期失败: {e}", LogLevel.WARNING)
-
-    def _process_server_renewals(self, servers_to_renew: list) -> bool:
-        """处理服务器续期，返回是否全部成功。"""
-        self.log(
-            f"🔍 检测到 {len(servers_to_renew)} 台服务器需要续期: {[s['id'] for s in servers_to_renew]}"
-        )
-        all_success = True
-        for server in servers_to_renew:
-            self.log(f"\n🔄 --- 正在为服务器 {server['id']} 执行续期 ---")
-            try:
-                self._renew(server["id"])
-                self.log(
-                    f"服务器 {server['id']} 的续期流程已成功提交。", LogLevel.SUCCESS
-                )
-            except (RenewalError, requests.RequestException) as e:
-                self.log(
-                    f"为服务器 {server['id']} 续期时发生严重错误: {e}", LogLevel.ERROR
-                )
-                all_success = False
-        return all_success
-
-    def _check_post_renewal_status(self) -> None:
-        """检查续期后的服务器状态，并显示下次续约日期。"""
-        time.sleep(POST_RENEWAL_CHECK_DELAY)
-        server_list = self._fetch_server_list_with_retry()
-        servers_still_to_renew = [sv["id"] for sv in server_list if sv["renewable"]]
-
-        if servers_still_to_renew:
-            for server_id in servers_still_to_renew:
-                self.log(
-                    f"警告: 服务器 {server_id} 在续期操作后仍显示为可续约状态。",
-                    LogLevel.WARNING,
-                )
+        
+        put_resp = requests.put(api_url, headers=headers, json=commit_data)
+        if put_resp.status_code in [200, 201]:
+            log_step(f"[成功] 篡改 Github 规则完成！已产生新 Commit。下次启动时间: 日本时间 {target_date_str} 13:27 (底层Cron: {new_cron})")
         else:
-            self.log("所有服务器均已成功续订或无需续订！", LogLevel.CELEBRATION)
+            log_step(f"[错误] 修改 YAML 失败: {put_resp.text}")
+            
+    except Exception as e:
+        log_step(f"[错误] Cron 更新报错: {e}")
 
-        # 无论续约状态如何，都尝试输出下次续约日期
-        self._display_next_renewal_dates(server_list)
+# ==========================================
+# 核心自动化逻辑 (代理穿透 + 阶梯打码)
+# ==========================================
+def run():
+    # 过程收集器
+    process_logs = []
+    def log_step(msg):
+        clean_msg = msg.strip("\n")
+        print(clean_msg)
+        process_logs.append(clean_msg)
 
-    def _fetch_server_list_with_retry(self) -> list[dict]:
-        """获取服务器列表，如果没有日期则重试一次。"""
-        server_list = self._get_servers()
-        has_valid_date = any(s["date"] and s["date"] != "未知日期" for s in server_list)
-        if not has_valid_date:
-            self.log(f"首次读取未获取到续约日期，等待 {SERVER_LIST_RETRY_DELAY} 秒后重试...")
-            time.sleep(SERVER_LIST_RETRY_DELAY)
-            server_list = self._get_servers()
-        return server_list
+    EMAIL = os.environ.get('XSERVER_EMAIL')
+    PASSWORD = os.environ.get('XSERVER_PASSWORD')
+    YES_KEY = os.environ.get('YESCAPTCHA_KEY')
+    GEMINI_KEYS_STR = os.environ.get('GEMINI_API_KEYS')
+    gemini_keys = [k.strip() for k in GEMINI_KEYS_STR.split(',')] if GEMINI_KEYS_STR else []
+    
+    PROXY_IP = os.environ.get('PROXY_IP')
+    PROXY_PORT = os.environ.get('PROXY_PORT')
+    PROXY_USER = os.environ.get('PROXY_USER')
+    PROXY_PASS = os.environ.get('PROXY_PASS')
 
-    def _display_next_renewal_dates(self, server_list: list[dict]) -> None:
-        """显示每台服务器的下次续约日期并输出最早日期。"""
-        earliest_date = None
-        for server in server_list:
-            if server["date"] and server["date"] != "未知日期":
-                self.log(f"   - 服务器 {server['id']}: 下次可续约日期 {server['date']}")
-                if earliest_date is None or server["date"] < earliest_date:
-                    earliest_date = server["date"]
+    if not all([EMAIL, PASSWORD, YES_KEY, PROXY_IP, PROXY_PORT, PROXY_USER, PROXY_PASS]) or not gemini_keys:
+        msg = "[失败] <b>脚本运行失败</b>\n环境变量缺失（请检查代理配置或 API Keys）！"
+        log_step("运行失败: 环境变量缺失")
+        send_tg_msg(msg, process_logs)
+        return
 
-        if earliest_date:
-            self.log(f"📅 下次续约窗口开启时间: {earliest_date}", LogLevel.INFO)
-            if GITHUB_OUTPUT:
-                self._output_next_schedule(str(earliest_date))
+    # 全局时间基准：锁定日本时间 (UTC+9)
+    jst = timezone(timedelta(hours=9))
+    now_jst = datetime.now(jst)
+    today_str = now_jst.strftime("%Y-%m-%d")
+    tomorrow_str = (now_jst + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # ==================== 主入口 ====================
+    playwright_proxy = {
+        "server": f"http://{PROXY_IP}:{PROXY_PORT}",
+        "username": PROXY_USER,
+        "password": PROXY_PASS
+    }
 
-    def run(self) -> int:
-        """执行续期任务的主入口。
+    with sync_playwright() as p:
+        log_step(f"正在通过私人代理 {PROXY_IP} 启动隐身浏览器...")
+        browser = p.chromium.launch(
+            headless=False,
+            proxy=playwright_proxy,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-infobars',
+                '--start-maximized'
+            ]
+        )
+        context = browser.new_context(viewport={'width': 1920, 'height': 1080})
+        page = context.new_page()
+        apply_stealth(page)
 
-        Returns:
-            EXIT_SUCCESS (0): 续约成功或无需续约
-            EXIT_FAILURE (1): 续约失败
-            EXIT_SKIPPED (2): 未到续约日期
-        """
-        config_ok, missing = self.validate_config()
-        if not config_ok:
-            self.log(f"必要的配置未设置: {', '.join(missing)}", LogLevel.ERROR)
-            if self.log_messages:
-                self.send_status_email("配置错误")
-            return EXIT_FAILURE
-
-        status = "成功"
-        exit_code = EXIT_SUCCESS
         try:
-            self.log("--- 开始euserv-renewal-bot自动续期任务 ---")
+            log_step("[1] 正在登录 Xserver...")
+            page.goto("https://secure.xserver.ne.jp/xapanel/login/xvps/")
+            page.fill("input[name='memberid']", EMAIL)
+            page.fill("input[name='user_password']", PASSWORD)
+            
+            with page.expect_navigation():
+                page.evaluate("""() => {
+                    let submitBtn = document.querySelector('button[type="submit"], input[type="submit"]');
+                    if (submitBtn) submitBtn.click();
+                    else document.forms[0].submit();
+                }""")
+            
+            log_step("[2] 检查 VPS 到期时间...")
+            page.wait_for_timeout(5000)
+            
+            row = page.locator("tr:has(.freeServerIco)")
+            if row.count() == 0:
+                raise Exception("未找到免费 VPS 实例。")
 
-            # 预加载 OCR 模型，减少首次验证码识别延迟
-            self.prewarm_ocr()
+            expire_text = row.locator(".contract__term").inner_text().strip()
+            
+            try:
+                # 提取面板上的日本到期日，计算计划续期日
+                expire_dt = datetime.strptime(expire_text, "%Y-%m-%d")
+                renew_date_str = (expire_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+            except:
+                renew_date_str = "未知"
 
-            self._perform_login()
+            log_step(f"    日本今天: {today_str} | 计划续期: {renew_date_str} | 彻底到期: {expire_text}")
 
-            all_servers = self._get_servers()
-            servers_to_renew = [server for server in all_servers if server["renewable"]]
+            # 情景 1：今天不需要续期 (或者刚刚完成续期后的第二天复查)
+            if expire_text != tomorrow_str:
+                log_step("    还没到续期时间，脚本收工。")
+                
+                # 安排休眠：一直睡到要续期的那天下午 13:27 再醒来
+                if renew_date_str != "未知":
+                    update_github_cron(renew_date_str, log_step)
+                    
+                msg = f"[播报] <b>Github xserver-auto:状态播报 (暂无需操作)</b>\n\n[今日] <b>今天是:</b> {today_str} (JST)\n[计划] <b>要续期是:</b> {renew_date_str} (JST)\n[到期] <b>到期是:</b> {expire_text} (JST)"
+                send_tg_msg(msg, process_logs)
+                browser.close()
+                return
 
-            if not all_servers:
-                self.log(
-                    "未检测到任何服务器合同，请检查页面是否正常！", LogLevel.WARNING
-                )
-                status = "异常"
-                exit_code = EXIT_FAILURE
-                self._safe_refresh_session()
-            elif not servers_to_renew:
-                # 智能调度：未到续约日期，跳过执行
-                self._log_non_renewable_servers(all_servers)
-                self.log("ℹ️ 未到续约日期，跳过执行。", LogLevel.INFO)
-                status = "跳过"
-                return EXIT_SKIPPED
+            log_step("[3] 获取续期链接...")
+            detail_link = row.locator("a[href^='/xapanel/xvps/server/detail?id=']").first.get_attribute("href")
+            extend_url = "https://secure.xserver.ne.jp" + detail_link.replace("detail?id", "freevps/extend/index?id_vps")
+
+            max_attempts = 15
+            log_step(f"[4] 处理验证码与 CF 防御 (梯队战术，最高重试 {max_attempts} 次)...")
+            is_success = False
+            
+            for attempt in range(1, max_attempts + 1):
+                page.goto(extend_url)
+                page.wait_for_timeout(1000)
+                
+                with page.expect_navigation():
+                    page.locator("[formaction='/xapanel/xvps/server/freevps/extend/conf']").click()
+                
+                page.wait_for_timeout(2000)
+                
+                img_locator = page.locator("img[src^='data:image'], img[src^='data:']")
+                if img_locator.count() == 0:
+                    raise Exception("页面上找不到验证码图片！")
+                    
+                img_b64_full = img_locator.first.get_attribute("src")
+                mime_type = img_b64_full.split(";")[0].replace("data:", "")
+                b64_data = img_b64_full.split(",")[1]
+                captcha_code = None
+
+                if attempt <= 3:
+                    log_step(f"    >>> 开始第 {attempt} 次尝试 (先锋营：私人 run.app 接口) <<<")
+                    try:
+                        ocr_res = requests.post('https://captcha-120546510085.asia-northeast1.run.app', data=img_b64_full, headers={'Content-Type': 'text/plain'})
+                        if len(ocr_res.text.strip()) >= 4:
+                            captcha_code = ocr_res.text.strip()
+                            log_step(f"    私人 API 识别成功: {captcha_code}")
+                    except Exception as e:
+                        log_step(f"    私人 API 报错或已失效: {e}")
+                else:
+                    gemini_attempt = attempt - 3 
+                    key_index = (gemini_attempt - 1) % len(gemini_keys)
+                    current_gemini_key = gemini_keys[key_index]
+                    
+                    log_step(f"    >>> 开始第 {attempt} 次尝试 (主力军：Gemini 3.1 Flash Lite | Key: {key_index + 1}) <<<")
+                    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={current_gemini_key}"
+                    gemini_prompt = "这是一张包含日文平假名的验证码图片，上面有很重的黑色干扰划线。请你忽略干扰线，仔细辨认图片中的平假名，并将它们逐个转换为对应的 6 位半角阿拉伯数字。例如：如果图片里写着「いちななきゅうぜろはちろく」，你就输出「179086」。绝对不要包含解题过程，只能输出 6 位连续数字！如果你看不清，尽最大努力猜测！"
+                    
+                    try:
+                        gemini_res = requests.post(gemini_url, json={"contents": [{"parts": [{"text": gemini_prompt}, {"inline_data": {"mime_type": mime_type, "data": b64_data}}]}]}).json()
+                        if 'candidates' in gemini_res:
+                            raw_text = gemini_res['candidates'][0]['content']['parts'][0]['text'].strip()
+                            match = re.search(r'\d{6}', raw_text)
+                            if match: 
+                                captcha_code = match.group(0)
+                                log_step(f"    Gemini 提取成功: {captcha_code}")
+                    except Exception as e:
+                        log_step(f"    Gemini 请求报错: {e}")
+
+                if not captcha_code: captcha_code = "000000" 
+                page.evaluate(f"""(code) => {{ let input = document.querySelector('[placeholder*="上の画像"]'); if (input) {{ input.value = code; input.dispatchEvent(new Event('input', {{ bubbles: true }})); }} }}""", captcha_code)
+
+                cf_container = page.locator(".cf-turnstile")
+                if cf_container.count() > 0:
+                    site_key = cf_container.first.get_attribute("data-sitekey")
+                    action = cf_container.first.get_attribute("data-action")
+                    cdata = cf_container.first.get_attribute("data-cdata")
+                    
+                    log_step("    呼叫 YesCaptcha 破解护盾...")
+                    task_params = {
+                        "type": "TurnstileTask",
+                        "websiteURL": page.url,
+                        "websiteKey": site_key,
+                        "proxyType": "http",
+                        "proxyAddress": PROXY_IP,
+                        "proxyPort": int(PROXY_PORT),
+                        "proxyLogin": PROXY_USER,
+                        "proxyPassword": PROXY_PASS
+                    }
+                    if action: task_params["pageAction"] = action
+                    if cdata: task_params["pageData"] = cdata
+                    
+                    create_res = requests.post("https://api.yescaptcha.com/createTask", json={"clientKey": YES_KEY, "task": task_params}).json()
+                    if create_res.get("errorId") != 0: raise Exception(f"YesCaptcha 创建失败: {create_res}")
+                    task_id = create_res["taskId"]
+                    cf_token = None
+                    
+                    for i in range(20):
+                        time.sleep(3)
+                        res = requests.post("https://api.yescaptcha.com/getTaskResult", json={"clientKey": YES_KEY, "taskId": task_id}).json()
+                        if res.get("status") == "ready":
+                            cf_token = res["solution"]["token"]
+                            break
+                    
+                    if not cf_token: raise Exception("YesCaptcha Token 超时！")
+                    
+                    log_step("    获取 CF 令牌成功，注入...")
+                    page.evaluate(f"""(token) => {{
+                        document.querySelectorAll('input[name="cf-turnstile-response"]').forEach(el => el.remove());
+                        let cfInput = document.createElement('input'); cfInput.type = 'hidden'; cfInput.name = 'cf-turnstile-response'; cfInput.value = token; document.forms[0].appendChild(cfInput);
+                        let cfContainer = document.querySelector('.cf-turnstile');
+                        if (cfContainer) {{
+                            cfContainer.style.border = "3px solid #2ECC71"; let cbName = cfContainer.getAttribute('data-callback');
+                            if (cbName && typeof window[cbName] === 'function') {{ window[cbName](token); }} 
+                            else {{ let btn = document.querySelector('input[type="submit"], button[type="submit"], #submit_button'); if (btn) {{ btn.removeAttribute('disabled'); btn.classList.remove('btn--disabled', 'btn--loading'); }} }}
+                        }}
+                    }}""", cf_token)
+                
+                log_step("    [5] 执行原生表单提交！")
+                time.sleep(1) 
+                page.evaluate("""() => { const submitBtn = document.querySelector('input[type="submit"], button[type="submit"], #submit_button'); if (submitBtn) submitBtn.click(); else document.forms[0].submit(); }""")
+                log_step("    等待服务器处理 (8秒)...")
+                page.wait_for_timeout(8000)
+                
+                error_msgs = page.locator(".errorMessage, .alert-danger, .error-text, [class*='error']")
+                err_text = ""
+                if error_msgs.count() > 0:
+                    for i in range(error_msgs.count()):
+                        txt = error_msgs.nth(i).inner_text().strip()
+                        if txt: err_text += txt + " "
+                
+                if err_text:
+                    log_step(f"    网页报错：{err_text}")
+                    if attempt < max_attempts: continue
+                    else: raise Exception(f"重试 {max_attempts} 次均失败: {err_text}")
+                elif "extend/conf" in page.url or "extend/do" in page.url:
+                    log_step("    页面未跳转，可能被静默拦截。")
+                    if attempt < max_attempts: continue
+                    else: raise Exception(f"连续 {max_attempts} 次被服务器拦截。")
+                else:
+                    is_success = True
+                    break
+
+            # 情景 2：冲塔续期成功！
+            if is_success:
+                log_step("续期成功！")
+                update_github_cron(tomorrow_str, log_step)
+                
+                success_msg = f"[成功] <b>Github xserver-auto:恭喜！</b>\nVPS 续期大功告成！阶梯战术通关！\n\n[执行] <b>续期执行日:</b> {today_str}\n[原到期] <b>续期前到期日:</b> {expire_text}\n\n<i>(系统已安排明天 13:27 自动醒来复查状态，并进入深睡眠~)</i>"
+                send_tg_msg(success_msg, process_logs)
+                
+                browser.close()
             else:
-                if not self._process_server_renewals(servers_to_renew):
-                    status = "失败"
-                    exit_code = EXIT_FAILURE
-                self._safe_refresh_session()
+                raise Exception("未知原因退出循环。")
 
-            self._check_post_renewal_status()
-            self.log("\n🏁 --- 所有工作完成 ---")
-
-        except (LoginError, RenewalError, PinRetrievalError, CaptchaError) as e:
-            status = "失败"
-            exit_code = EXIT_FAILURE
-            self.log(f"❗ 脚本执行过程中发生致命错误: {e}")
-        finally:
-            self._cleanup()  # 关闭 HTTP Session
-            self.send_status_email(status)
-
-        return exit_code
-
-
-def main() -> None:
-    """向后兼容的入口点，使用 RenewalBot 实例。"""
-    bot = RenewalBot()
-    exit_code = bot.run()
-    exit(exit_code)
-
+        except Exception as e:
+            # 情景 3：任何报错卡死
+            safe_e = html.escape(str(e))
+            error_trace = traceback.format_exc()
+            log_step(f"运行异常：{str(e)}")
+            
+            # 报错强制修改代码明天继续干它！
+            update_github_cron(tomorrow_str, log_step)
+            
+            error_msg = f"[错误] <b>续期脚本出错了！</b>\n已安排明天重试。\n\n<b>错误详情:</b>\n<pre>{safe_e}</pre>"
+            send_tg_msg(error_msg, process_logs)
+            browser.close()
 
 if __name__ == "__main__":
-    main()
+    run()
