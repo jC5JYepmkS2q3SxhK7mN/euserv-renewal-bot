@@ -15,8 +15,6 @@ import email
 from email.message import Message
 from datetime import date
 from typing import Any, Callable
-import smtplib
-from email.mime.text import MIMEText
 import hmac
 import struct
 import ast
@@ -46,10 +44,11 @@ EUSERV_PASSWORD = os.getenv("EUSERV_PASSWORD", "")
 EUSERV_2FA = os.getenv("EUSERV_2FA", "")
 CAPTCHA_USERID = os.getenv("CAPTCHA_USERID", "")
 CAPTCHA_APIKEY = os.getenv("CAPTCHA_APIKEY", "")
+
+# 仅保留用于读取 PIN 码的 IMAP 邮箱配置
 EMAIL_HOST = os.getenv("EMAIL_HOST", "")
 EMAIL_USERNAME = os.getenv("EMAIL_USERNAME", "")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")
-NOTIFICATION_EMAIL = os.getenv("NOTIFICATION_EMAIL", "")
 
 # Telegram 环境变量
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
@@ -75,13 +74,6 @@ EMAIL_MAX_RETRIES = 3
 EXIT_SUCCESS = 0  # 续约成功或无需续约
 EXIT_FAILURE = 1  # 续约失败，需要重试
 EXIT_SKIPPED = 2  # 未到续约日期，跳过执行
-
-# SMTP 配置 (可选环境变量)
-SMTP_HOST = os.getenv("SMTP_HOST") or (
-    EMAIL_HOST.replace("imap", "smtp") if EMAIL_HOST else ""
-)
-_smtp_port_env = os.getenv("SMTP_PORT", "")
-SMTP_PORT = int(_smtp_port_env) if _smtp_port_env and _smtp_port_env.strip() else 587
 
 # GitHub Actions 输出文件
 GITHUB_OUTPUT = os.getenv("GITHUB_OUTPUT", "")
@@ -215,35 +207,6 @@ class RenewalBot:
         return len(missing) == 0, missing
 
     # ==================== 推送通知 ====================
-
-    def send_status_email(self, subject_status: str) -> None:
-        """发送状态通知邮件。"""
-        if not (NOTIFICATION_EMAIL and EMAIL_USERNAME and EMAIL_PASSWORD):
-            self.log("邮件通知所需的一个或多个Secrets未设置，跳过发送邮件。")
-            return
-        if not SMTP_HOST:
-            self.log("无法推断 SMTP 服务器地址，跳过发送邮件。")
-            return
-        self.log("正在准备发送状态通知邮件...")
-        sender = EMAIL_USERNAME
-        recipient = NOTIFICATION_EMAIL
-        subject = f"Euserv 续约脚本运行报告 - {subject_status}"
-        body = "Euserv 自动续约脚本本次运行的详细日志如下：\n\n" + "\n".join(
-            self.log_messages
-        )
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = subject
-        msg["From"] = sender
-        msg["To"] = recipient
-        try:
-            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=HTTP_TIMEOUT_SECONDS)
-            server.starttls()
-            server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_USERNAME, [recipient], msg.as_string())
-            server.quit()
-            self.log("状态通知邮件已成功发送！", LogLevel.CELEBRATION)
-        except smtplib.SMTPException as e:
-            self.log(f"发送邮件失败: {e}", LogLevel.ERROR)
 
     def send_telegram_message(self, subject_status: str) -> None:
         """发送状态通知到 Telegram。"""
@@ -860,7 +823,6 @@ class RenewalBot:
         if not config_ok:
             self.log(f"必要的配置未设置: {', '.join(missing)}", LogLevel.ERROR)
             if self.log_messages:
-                self.send_status_email("配置错误")
                 self.send_telegram_message("配置错误")
             return EXIT_FAILURE
 
@@ -905,7 +867,6 @@ class RenewalBot:
             self.log(f"❗ 脚本执行过程中发生致命错误: {e}")
         finally:
             self._cleanup()  # 关闭 HTTP Session
-            self.send_status_email(status)
             self.send_telegram_message(status)
 
         return exit_code
